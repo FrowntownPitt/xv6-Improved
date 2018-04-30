@@ -6,6 +6,7 @@
 #include "x86.h"
 #include "proc.h"
 #include "spinlock.h"
+#include "fs.h"
 
 struct {
   struct spinlock lock;
@@ -17,8 +18,17 @@ static struct proc *initproc;
 int nextpid = 1;
 extern void forkret(void);
 extern void trapret(void);
+extern char end[];
 
 static void wakeup1(void *chan);
+
+
+int getproc(struct proc **s){
+    acquire(&ptable.lock);
+    *s = ptable.proc;
+    release(&ptable.lock);
+    return 0;
+}
 
 void
 pinit(void)
@@ -130,6 +140,11 @@ userinit(void)
     panic("userinit: out of memory?");
   inituvm(p->pgdir, _binary_initcode_start, (int)_binary_initcode_size);
   p->sz = PGSIZE;
+  p->nPages = 0;
+  p->nPhysPages = 0;
+
+  //createSwapFile(p);
+
   memset(p->tf, 0, sizeof(*p->tf));
   p->tf->cs = (SEG_UCODE << 3) | DPL_USER;
   p->tf->ds = (SEG_UDATA << 3) | DPL_USER;
@@ -146,11 +161,15 @@ userinit(void)
   // run this process. the acquire forces the above
   // writes to be visible, and the lock is also needed
   // because the assignment might not be atomic.
+
+  //createSwapFile(p);
+
   acquire(&ptable.lock);
 
   p->state = RUNNABLE;
 
   release(&ptable.lock);
+  //createSwapFile(p);
 }
 
 // Grow current process's memory by n bytes.
@@ -197,6 +216,18 @@ fork(void)
     return -1;
   }
   np->sz = curproc->sz;
+  np->nPages = curproc->nPages;
+  np->nPhysPages = curproc->nPhysPages;
+  np->pageFaults = 0;
+  np->fifoPointer = 0;
+
+  np->pds.head = 0;
+  np->pds.end  = 0;
+
+  for(i = 0; i < MAX_PHYS_PAGES; i++){
+    np->pds.list[i].used = 0;
+  }
+
   np->parent = curproc;
   *np->tf = *curproc->tf;
 
@@ -212,11 +243,32 @@ fork(void)
 
   pid = np->pid;
 
+  createSwapFile(np);
+
+  if(curproc->nPages > MAX_PHYS_PAGES){
+    int nSwapPages = curproc->nPages - curproc->nPhysPages;
+    char swap[PGSIZE/4];
+      
+    
+    int j;
+
+    for(j=0; j< (PGSIZE * nSwapPages) / sizeof(swap); j++){
+      readFromSwapFile(curproc, swap, j*sizeof(swap), sizeof(swap));
+
+      writeToSwapFile(np, swap, j*sizeof(swap), sizeof(swap));
+    }
+
+  }
+
   acquire(&ptable.lock);
 
   np->state = RUNNABLE;
 
+  //createSwapFile(np);
+
   release(&ptable.lock);
+
+  //createSwapFile(np);
 
   return pid;
 }
@@ -227,9 +279,17 @@ fork(void)
 void
 exit(void)
 {
+
   struct proc *curproc = myproc();
   struct proc *p;
   int fd;
+
+  #ifdef TRUE
+  //cprintf("Exiting\n");
+  procdump();
+  #endif
+  
+  removeSwapFile(curproc);
 
   if(curproc == initproc)
     panic("init exiting");
@@ -260,6 +320,7 @@ exit(void)
         wakeup1(initproc);
     }
   }
+
 
   // Jump into the scheduler, never to return.
   curproc->state = ZOMBIE;
@@ -511,11 +572,15 @@ procdump(void)
   [RUNNING]   "run   ",
   [ZOMBIE]    "zombie"
   };
-  int i;
+  //int i;
   struct proc *p;
   char *state;
-  uint pc[10];
+  //uint pc[10];
+  int currUsed = 0;
 
+  //acquire(&ptable.lock);
+  cprintf("\n pid \t| state \t| name   \t| # Pages\t|"
+    " Pgd out\t| Faults\t| Pgd cnt\t\n");
   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
     if(p->state == UNUSED)
       continue;
@@ -523,12 +588,43 @@ procdump(void)
       state = states[p->state];
     else
       state = "???";
-    cprintf("%d %s %s", p->pid, state, p->name);
+    int x = p->nPhysPages;
+    currUsed += x;
+    cprintf(" %d \t| %s \t| %s%s\t| ", p->pid, state, p->name, 
+          (strlen(p->name) < 5) ? "\t" : "" );
+    cprintf("%d     \t| %d     \t| %d     \t| %d     \t", p->nPages, p->nPages-p->nPhysPages, 
+          p->pageFaults, p->pageSwapped);
+    cprintf("");
     if(p->state == SLEEPING){
-      getcallerpcs((uint*)p->context->ebp+2, pc);
-      for(i=0; i<10 && pc[i] != 0; i++)
-        cprintf(" %p", pc[i]);
+
+
+      //getcallerpcs((uint*)p->context->ebp+2, pc);
+      //or(i=0; i<10 && pc[i] != 0; i++)
+      //  cprintf(" %p", pc[i]);
     }
+
     cprintf("\n");
   }
+
+  int totalPhysical  = (512*1024*1024/PGSIZE); //512 megabytes
+  int totalKernel    = (PGROUNDUP(V2P(end))/PGSIZE);
+  int numFreePages = ((totalPhysical-totalKernel) - currUsed);
+  int calcTotal = totalPhysical - totalKernel;
+
+  //double available = ((double)numFreePages) / ((double)calcTotal);
+
+  //int intPart = (int)(available * 100);
+  //available = intPart;
+  //int decPart = intPart;
+  //available = intPart;
+  //long intPart = numFreePages - calcTotal;
+  //int decPart = (int)(available*1000*100);
+  //decPart = decPart - intPart*1000;
+
+  //cprintf("Free pages in the system: %d.%d%%\n", intPart,
+  //        0);
+  //release(&ptable.lock);
+   cprintf("Free pages in the system: %d\% (%d pages)\n",
+             (100*(numFreePages) / calcTotal), numFreePages);
+  cprintf("\n");
 }
