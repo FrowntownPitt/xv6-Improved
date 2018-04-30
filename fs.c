@@ -373,7 +373,7 @@ iunlockput(struct inode *ip)
 static uint
 bmap(struct inode *ip, uint bn)
 {
-  uint addr, *a;
+  uint addr, *a, *b;
   struct buf *bp;
 
   if(bn < NDIRECT){
@@ -383,16 +383,53 @@ bmap(struct inode *ip, uint bn)
   }
   bn -= NDIRECT;
 
-  if(bn < NINDIRECT){
+  // Singly-indirect
+  if(bn < CSINDIRECT){
+    int index0 = bn/(BSIZE/sizeof(int));
     // Load indirect block, allocating if necessary.
-    if((addr = ip->addrs[NDIRECT]) == 0)
-      ip->addrs[NDIRECT] = addr = balloc(ip->dev);
+    if((addr = ip->addrs[NDIRECT+index0]) == 0)
+      ip->addrs[NDIRECT+index0] = addr = balloc(ip->dev);
     bp = bread(ip->dev, addr);
     a = (uint*)bp->data;
-    if((addr = a[bn]) == 0){
-      a[bn] = addr = balloc(ip->dev);
+    if((addr = a[bn%(BSIZE/sizeof(int))]) == 0){
+      a[bn%(BSIZE/sizeof(int))] = addr = balloc(ip->dev);
       log_write(bp);
     }
+    brelse(bp);
+    return addr;
+  } 
+
+  bn -= CSINDIRECT;
+
+  // Doubly-indirect blocks
+  if(bn < CDINDIRECT){
+    int index0 = bn / (BSIZE/sizeof(int));
+    int index1 = bn % (BSIZE/sizeof(int));
+
+    int dindex = index0 / (BSIZE/sizeof(int));
+
+    //if(dindex > 0)
+    //  cprintf("dindex: %d\n", index0);
+    if((addr = ip->addrs[NDIRECT+NSINDIRECT+dindex]) == 0)
+      ip->addrs[NDIRECT+NSINDIRECT+dindex] = addr = balloc(ip->dev);
+
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+
+    if((addr = a[index0 %(BSIZE/sizeof(int))]) == 0){
+      a[index0 %(BSIZE/sizeof(int))] = addr = balloc(ip->dev);
+      log_write(bp);
+    }
+    brelse(bp);
+
+    bp = bread(ip->dev, addr);
+    b = (uint*)bp->data;
+
+    if((addr = b[index1]) == 0){
+      b[index1] = addr = balloc(ip->dev);
+      log_write(bp);
+    }
+
     brelse(bp);
     return addr;
   }
